@@ -1,96 +1,91 @@
-import numpy as np
 import pandas as pd
+import numpy as np
 import yfinance as yf
-import matplotlib.pyplot as plt
 
-# Step 1: Select 14 Top Nifty 50 Heavyweight Tickers (Yahoo Finance NSE format)
-tickers = [
-    'RELIANCE.NS', 'HDFCBANK.NS', 'ICICIBANK.NS', 'INFY.NS', 'TCS.NS',
-    'ITC.NS', 'LT.NS', 'SBIN.NS', 'BHARTIARTL.NS', 'AXISBANK.NS',
-    'HINDUNILVR.NS', 'KOTAKBANK.NS', 'BAJFINANCE.NS', 'MARUTI.NS'
-]
+# 1. Define the Top 8 Nifty 50 Stocks and their free-float weights
+stocks_data = {
+    'HDFCBANK.NS': 0.25,  
+    'RELIANCE.NS': 0.20,  
+    'ICICIBANK.NS': 0.18, 
+    'INFY.NS': 0.10,      
+    'BHARTIARTL.NS': 0.10,
+    'LT.NS': 0.08,        
+    'AXISBANK.NS': 0.05,  
+    'SBIN.NS': 0.04       
+}
 
-# Step 2: Define corresponding Free-Float Market Cap Weights 
-# (These are approximate illustrative weights representing relative free-float dominance)
-raw_weights = [
-    0.14, 0.13, 0.09, 0.08, 0.08, 
-    0.06, 0.06, 0.05, 0.05, 0.05, 
-    0.05, 0.05, 0.05, 0.04
-]
+tickers = list(stocks_data.keys())
+weights = np.array(list(stocks_data.values()))
 
-# Normalize weights so they strictly sum up to 1.0 (100%)
-weights = np.array(raw_weights) / sum(raw_weights)
+print("Fetching intraday data (5-minute interval)...")
+# Note: yfinance allows up to 60 days for 5m intraday data
+data = yf.download(tickers, period="2d", interval="5m", group_by="ticker", progress=False)
 
-# Download historical Adjusted Close price data (e.g., past 1 year)
-print("Downloading historical data for heavyweights...")
-data = yf.download(tickers, period="1y", interval="1d")['Close']
+# 2. Extract DataFrames for Open, High, Low, Close, and Volume
+open_df = pd.DataFrame({t: data[t]['Open'] for t in tickers})
+high_df = pd.DataFrame({t: data[t]['High'] for t in tickers})
+low_df = pd.DataFrame({t: data[t]['Low'] for t in tickers})
+close_df = pd.DataFrame({t: data[t]['Close'] for t in tickers})
+volume_df = pd.DataFrame({t: data[t]['Volume'] for t in tickers})
 
-# Drop any columns with missing data to keep calculations clean
-data = data.dropna(axis=1, how='any')
+# Drop rows where all values are NaN
+open_df.dropna(how='all', inplace=True)
+high_df.dropna(how='all', inplace=True)
+low_df.dropna(how='all', inplace=True)
+close_df.dropna(how='all', inplace=True)
+volume_df.fillna(0, inplace=True)
 
-# Step 3: Function to calculate J. Welles Wilder's RSI accurately
-def calculate_wilder_rsi(close_series, period=14):
-    delta = close_series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    
-    avg_gain = np.zeros_like(close_series, dtype=float)
-    avg_loss = np.zeros_like(close_series, dtype=float)
-    
-    # Initialize first average using SMA at the 'period' index
-    if len(close_series) <= period:
-        return pd.Series(np.nan, index=close_series.index)
-        
-    avg_gain[period] = gain.iloc[1:period+1].mean()
-    avg_loss[period] = loss.iloc[1:period+1].mean()
-    
-    # Recursive Wilder's smoothing loop for subsequent candles
-    for i in range(period + 1, len(close_series)):
-        avg_gain[i] = (avg_gain[i-1] * (period - 1) + gain.iloc[i]) / period
-        avg_loss[i] = (avg_loss[i-1] * (period - 1) + loss.iloc[i]) / period
-        
-    # Prevent division by zero
-    rs = avg_gain / np.where(avg_loss == 0, 1e-10, avg_loss)
-    rsi = 100 - (100 / (1 + rs))
-    
-    # Handle strict edge cases
-    rsi = np.where(avg_loss == 0, 100.0, rsi)
-    rsi = np.where(avg_gain == 0, 0.0, rsi)
-    
-    # Set warmup period values to NaN
-    rsi[:period] = np.nan
-    
-    return pd.Series(rsi, index=close_series.index)
+# 3. Compute Weighted Synthetic OHLC Candles
+synthetic_open = open_df.dot(weights)
+synthetic_high = high_df.dot(weights)
+synthetic_low = low_df.dot(weights)
+synthetic_close = close_df.dot(weights)
 
-# Calculate individual RSI for each stock
-rsi_df = pd.DataFrame(index=data.index)
-for ticker in data.columns:
-    rsi_df[ticker] = calculate_wilder_rsi(data[ticker], period=14)
+# Aggregate total volume for the basket across the 8 stocks
+synthetic_volume = volume_df.sum(axis=1)
 
-# Align weights with the downloaded columns (in case any ticker failed to download)
-active_tickers = list(rsi_df.columns)
-active_weights = [weights[tickers.index(t)] for t in active_tickers]
-active_weights = np.array(active_weights) / sum(active_weights) # Re-normalize
+# 4. Calculate Intraday VWAP
+# Typical Price of the synthetic basket
+synthetic_tp = (synthetic_high + synthetic_low + synthetic_close) / 3
 
-# Compute the Final Free-Float Weighted Composite RSI
-composite_rsi = pd.Series(0.0, index=rsi_df.index)
-for i, ticker in enumerate(active_tickers):
-    composite_rsi += rsi_df[ticker] * active_weights[i]
+# Extract date to reset cumulative VWAP daily
+dates = synthetic_tp.index.date
 
-# Drop initial NaN rows created during the RSI warmup phase
-composite_rsi = composite_rsi.dropna()
+# Calculate Cumulative (Typical Price * Volume) and Cumulative Volume per day
+df_calc = pd.DataFrame({
+    'TP_Vol': synthetic_tp * synthetic_volume,
+    'Volume': synthetic_volume,
+    'Date': dates
+}, index=synthetic_tp.index)
 
-print("\n--- Custom Composite RSI Calculated Successfully ---")
-print(composite_rsi.tail(5))
+# Group by date to ensure VWAP resets each trading day
+cum_tp_vol = df_calc.groupby('Date')['TP_Vol'].cumsum()
+cum_vol = df_calc.groupby('Date')['Volume'].cumsum()
 
-# Plotting the Custom Indicator
-plt.figure(figsize=(12, 6))
-plt.plot(composite_rsi.index, composite_rsi, label='Nifty Heavyweight Composite RSI', color='purple', linewidth=1.5)
-plt.axhline(70, color='red', linestyle='--', alpha=0.5, label='Overbought (70)')
-plt.axhline(30, color='green', linestyle='--', alpha=0.5, label='Oversold (30)')
-plt.title('Custom Free-Float Weighted Heavyweight RSI (Nifty 50 Leaders)')
-plt.xlabel('Date')
-plt.ylabel('RSI Value')
-plt.legend(loc='upper left')
-plt.grid(True, alpha=0.3)
-plt.show()
+# Synthetic VWAP calculation
+synthetic_vwap = cum_tp_vol / cum_vol
+
+# Combine into a final synthetic intraday dataframe
+synthetic_intraday_df = pd.DataFrame({
+    'Open': synthetic_open,
+    'High': synthetic_high,
+    'Low': synthetic_low,
+    'Close': synthetic_close,
+    'Volume': synthetic_volume,
+    'VWAP': synthetic_vwap
+})
+
+print("\n--- Latest 5-Minute Synthetic Candles & VWAP ---")
+print(synthetic_intraday_df.tail(10))
+
+# 5. Summary of the most recent candle and VWAP state
+latest = synthetic_intraday_df.iloc[-1]
+print("\n--- Current Status ---")
+print(f"Timestamp : {synthetic_intraday_df.index[-1]}")
+print(f"Close     : {latest['Close']:.2f}")
+print(f"VWAP      : {latest['VWAP']:.2f}")
+
+if latest['Close'] > latest['VWAP']:
+    print("Market State: Price is ABOVE VWAP (Bullish intraday bias)")
+else:
+    print("Market State: Price is BELOW VWAP (Bearish intraday bias)")
