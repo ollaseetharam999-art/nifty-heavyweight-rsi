@@ -1,91 +1,90 @@
-import pandas as pd
+import os
+from flask import Flask
 import numpy as np
+import pandas as pd
 import yfinance as yf
 
-# 1. Define the Top 8 Nifty 50 Stocks and their free-float weights
-stocks_data = {
-    'HDFCBANK.NS': 0.25,  
-    'RELIANCE.NS': 0.20,  
-    'ICICIBANK.NS': 0.18, 
-    'INFY.NS': 0.10,      
-    'BHARTIARTL.NS': 0.10,
-    'LT.NS': 0.08,        
-    'AXISBANK.NS': 0.05,  
-    'SBIN.NS': 0.04       
-}
+app = Flask(__name__)
 
-tickers = list(stocks_data.keys())
-weights = np.array(list(stocks_data.values()))
 
-print("Fetching intraday data (5-minute interval)...")
-# Note: yfinance allows up to 60 days for 5m intraday data
-data = yf.download(tickers, period="2d", interval="5m", group_by="ticker", progress=False)
+@app.route("/")
+def calculate_synthetic_vwap():
+  stocks_data = {
+      "HDFCBANK.NS": 0.25,
+      "RELIANCE.NS": 0.20,
+      "ICICIBANK.NS": 0.18,
+      "INFY.NS": 0.10,
+      "BHARTIARTL.NS": 0.10,
+      "LT.NS": 0.08,
+      "AXISBANK.NS": 0.05,
+      "SBIN.NS": 0.04,
+  }
 
-# 2. Extract DataFrames for Open, High, Low, Close, and Volume
-open_df = pd.DataFrame({t: data[t]['Open'] for t in tickers})
-high_df = pd.DataFrame({t: data[t]['High'] for t in tickers})
-low_df = pd.DataFrame({t: data[t]['Low'] for t in tickers})
-close_df = pd.DataFrame({t: data[t]['Close'] for t in tickers})
-volume_df = pd.DataFrame({t: data[t]['Volume'] for t in tickers})
+  tickers = list(stocks_data.keys())
+  weights = np.array(list(stocks_data.values()))
 
-# Drop rows where all values are NaN
-open_df.dropna(how='all', inplace=True)
-high_df.dropna(how='all', inplace=True)
-low_df.dropna(how='all', inplace=True)
-close_df.dropna(how='all', inplace=True)
-volume_df.fillna(0, inplace=True)
+  data = yf.download(
+      tickers, period="2d", interval="5m", group_by="ticker", progress=False
+  )
 
-# 3. Compute Weighted Synthetic OHLC Candles
-synthetic_open = open_df.dot(weights)
-synthetic_high = high_df.dot(weights)
-synthetic_low = low_df.dot(weights)
-synthetic_close = close_df.dot(weights)
+  open_df = pd.DataFrame({t: data[t]["Open"] for t in tickers})
+  high_df = pd.DataFrame({t: data[t]["High"] for t in tickers})
+  low_df = pd.DataFrame({t: data[t]["Low"] for t in tickers})
+  close_df = pd.DataFrame({t: data[t]["Close"] for t in tickers})
+  volume_df = pd.DataFrame({t: data[t]["Volume"] for t in tickers})
 
-# Aggregate total volume for the basket across the 8 stocks
-synthetic_volume = volume_df.sum(axis=1)
+  open_df.dropna(how="all", inplace=True)
+  high_df.dropna(how="all", inplace=True)
+  low_df.dropna(how="all", inplace=True)
+  close_df.dropna(how="all", inplace=True)
+  volume_df.fillna(0, inplace=True)
 
-# 4. Calculate Intraday VWAP
-# Typical Price of the synthetic basket
-synthetic_tp = (synthetic_high + synthetic_low + synthetic_close) / 3
+  s_open = open_df.dot(weights)
+  s_high = high_df.dot(weights)
+  s_low = low_df.dot(weights)
+  s_close = close_df.dot(weights)
+  s_vol = volume_df.sum(axis=1)
 
-# Extract date to reset cumulative VWAP daily
-dates = synthetic_tp.index.date
+  s_tp = (s_high + s_low + s_close) / 3
+  dates = s_tp.index.date
 
-# Calculate Cumulative (Typical Price * Volume) and Cumulative Volume per day
-df_calc = pd.DataFrame({
-    'TP_Vol': synthetic_tp * synthetic_volume,
-    'Volume': synthetic_volume,
-    'Date': dates
-}, index=synthetic_tp.index)
+  df_calc = pd.DataFrame(
+      {"TP_Vol": s_tp * s_vol, "Volume": s_vol, "Date": dates}, index=s_tp.index
+  )
 
-# Group by date to ensure VWAP resets each trading day
-cum_tp_vol = df_calc.groupby('Date')['TP_Vol'].cumsum()
-cum_vol = df_calc.groupby('Date')['Volume'].cumsum()
+  s_vwap = (
+      df_calc.groupby("Date")["TP_Vol"].cumsum()
+      / df_calc.groupby("Date")["Volume"].cumsum()
+  )
 
-# Synthetic VWAP calculation
-synthetic_vwap = cum_tp_vol / cum_vol
+  latest_close = s_close.iloc[-1]
+  latest_vwap = s_vwap.iloc[-1]
+  timestamp = s_close.index[-1].strftime("%Y-%m-%d %H:%M:%S")
 
-# Combine into a final synthetic intraday dataframe
-synthetic_intraday_df = pd.DataFrame({
-    'Open': synthetic_open,
-    'High': synthetic_high,
-    'Low': synthetic_low,
-    'Close': synthetic_close,
-    'Volume': synthetic_volume,
-    'VWAP': synthetic_vwap
-})
+  bias = (
+      "Bullish (Above VWAP)"
+      if latest_close > latest_vwap
+      else "Bearish (Below VWAP)"
+  )
 
-print("\n--- Latest 5-Minute Synthetic Candles & VWAP ---")
-print(synthetic_intraday_df.tail(10))
+  return f"""
+    <html>
+        <head>
+            <title>Nifty Synthetic VWAP</title>
+            <meta http-equiv="refresh" content="60">
+        </head>
+        <body style="font-family: Arial; padding: 20px;">
+            <h2>Nifty 8-Stock Synthetic Candle & VWAP</h2>
+            <p><b>Timestamp:</b> {timestamp}</p>
+            <p><b>Synthetic Close:</b> {latest_close:.2f}</p>
+            <p><b>Synthetic VWAP:</b> {latest_vwap:.2f}</p>
+            <p><b>Market State:</b> {bias}</p>
+            <p style="color: gray; font-size: 12px;">(Page auto-refreshes every 60 seconds)</p>
+        </body>
+    </html>
+    """
 
-# 5. Summary of the most recent candle and VWAP state
-latest = synthetic_intraday_df.iloc[-1]
-print("\n--- Current Status ---")
-print(f"Timestamp : {synthetic_intraday_df.index[-1]}")
-print(f"Close     : {latest['Close']:.2f}")
-print(f"VWAP      : {latest['VWAP']:.2f}")
 
-if latest['Close'] > latest['VWAP']:
-    print("Market State: Price is ABOVE VWAP (Bullish intraday bias)")
-else:
-    print("Market State: Price is BELOW VWAP (Bearish intraday bias)")
+if __name__ == "__main__":
+  port = int(os.environ.get("PORT", 8080))
+  app.run(host="0.0.0.0", port=port)
