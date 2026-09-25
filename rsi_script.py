@@ -110,9 +110,13 @@ def calculate_synthetic_vwap():
       template="plotly_dark",
       xaxis_rangeslider_visible=False,
       height=500,
+      dragmode="zoom",
   )
 
-  chart_html = fig.to_html(full_html=False)
+  chart_html = fig.to_html(
+    full_html=False, config={"scrollZoom": True, "responsive": True}
+)
+
 
   return f"""
     <html>
